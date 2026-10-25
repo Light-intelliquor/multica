@@ -1,5 +1,7 @@
 "use client";
 
+import { CodeChangesSection } from "./code-changes-section";
+
 import {
   issueBehavesAs,
   issueBehavesAsAny,
@@ -2944,6 +2946,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
         defaultAgentId={issue.assignee_type === "agent" ? (issue.assignee_id ?? undefined) : undefined}
       />
       <PluginPanelSection issueId={issue.id} />
+      <CodeChangesSection issueId={issue.id} />
 
       {/* Parent issue — standalone section, only when the issue has a
           parent. Setting a parent is reachable via the issue actions menu;

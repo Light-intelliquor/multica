@@ -34,6 +34,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	"github.com/multica-ai/multica/server/pkg/awakeclock"
+	"github.com/multica-ai/multica/server/pkg/codechanges"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/redact"
 	"github.com/multica-ai/multica/server/pkg/skillbundle"
@@ -255,6 +256,8 @@ const (
 // reportTerminalTask gives the durable outbox one insertion point without
 // revisiting every task exit when it is added.
 type terminalTaskReport struct {
+	codeChanges    *codechanges.Snapshot
+	codeChangesRef codechanges.ExecutionRef
 	kind           terminalTaskReportKind
 	taskID         string
 	output         string
@@ -5849,6 +5852,8 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			taskID:           task.ID,
 			errorMessage:     err.Error(),
 			branchName:       result.BranchName,
+			codeChanges:      result.CodeChanges,
+			codeChangesRef:   result.CodeChangesRef,
 			workDir:          result.WorkDir,
 			durableWorkDir:   result.DurableWorkDir,
 			failureReason:    taskRunFailureReason(err),
@@ -6250,6 +6255,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			kind:                  terminalTaskReportComplete,
 			taskID:                taskID,
 			output:                result.Comment,
+			codeChanges:           result.CodeChanges,
+			codeChangesRef:        result.CodeChangesRef,
 			branchName:            result.BranchName,
 			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
@@ -6289,6 +6296,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			kind:           terminalTaskReportFail,
 			taskID:         taskID,
 			errorMessage:   result.Comment,
+			codeChanges:    result.CodeChanges,
+			codeChangesRef: result.CodeChangesRef,
 			sessionID:      result.SessionID,
 			workDir:        result.WorkDir,
 			durableWorkDir: result.DurableWorkDir,
@@ -6321,7 +6330,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	if _, err := persistedTerminalReport(report, time.Now()); err != nil {
 		return err
 	}
-	release, ok := d.beginTerminalReportDelivery(report.taskID)
+	release, ok := d.beginTerminalReportDelivery(terminalReportDeliveryKey(report))
 	if !ok {
 		return fmt.Errorf("terminal task report for %s is already being delivered", report.taskID)
 	}
@@ -6330,6 +6339,9 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	persisted := false
 	if d.terminalReports != nil {
 		if err := d.terminalReports.enqueue(report); err != nil {
+			if report.codeChanges != nil && errors.Is(err, errTerminalReportConflict) {
+				return err
+			}
 			// Durability is an availability improvement, not a prerequisite for
 			// the online callback. A read-only/full disk must not turn a request
 			// that the server could accept right now into a stuck task.
@@ -6349,7 +6361,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	if err != nil {
 		quarantined := false
 		if persisted {
-			item := pendingTerminalTaskReport{fileName: terminalReportFileName(report.taskID), report: report}
+			item := pendingTerminalTaskReport{fileName: terminalReportFileNameForReport(report), report: report}
 			quarantined = d.handleTerminalReportDeliveryError(ctx, item, err)
 		}
 		if persisted && !quarantined {
@@ -6360,7 +6372,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	if !persisted {
 		return nil
 	}
-	item := pendingTerminalTaskReport{fileName: terminalReportFileName(report.taskID), report: report}
+	item := pendingTerminalTaskReport{fileName: terminalReportFileNameForReport(report), report: report}
 	if err := d.terminalReports.acknowledge(item); err != nil {
 		d.signalTerminalReportReplay()
 		return fmt.Errorf("acknowledge terminal task report: %w", err)
@@ -6399,9 +6411,9 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	}
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
+		return d.client.completeTaskWithCodeChanges(ctx, report.codeChanges, report.codeChangesRef, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	case terminalTaskReportFail:
-		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
+		return d.client.failTaskWithCodeChanges(ctx, report.codeChanges, report.codeChangesRef, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
@@ -8290,6 +8302,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		d.markActiveEnvRoot(env.RootDir)
 		defer d.unmarkActiveEnvRoot(env.RootDir)
 	}
+	codeCapture := prepareTaskCodeChanges(ctx, task, env)
+	if codeCapture != nil {
+		defer codeCapture.finish(&taskResult)
+	}
 	// Finalize the worktree on EVERY exit path, success or failure: commit
 	// whatever the agent left uncommitted, then unregister the worktree from
 	// the user's repo. Deferred against the named return so a task that fails
@@ -8830,6 +8846,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// fields or ambient process environment. Register only for the provider
 	// execution window and always remove the credential afterwards.
 	d.registerActiveRepoCheckoutTask(agentToken, activeRepoCheckoutTask{
+		CodeChanges: codeCapture,
 		WorkspaceID: task.WorkspaceID,
 		TaskID:      task.ID,
 		AgentID:     task.AgentID,
