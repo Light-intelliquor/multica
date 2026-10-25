@@ -83,6 +83,13 @@ func (c *taskCodeChangeCapture) finish(result *TaskResult) {
 	remaining := codechanges.MaxDiffBytes
 	for _, repo := range repos {
 		root, ref, dirty := repo.root, "HEAD", true
+		// A preserved worktree may contain runtime credentials committed before
+		// cleanup refused delivery. Only Finalize's confirmed receipt is readable.
+		if repo.local && result.DurableWorkDir == "" {
+			snapshot.Reason = "capture_failed"
+			snapshot.Truncated = true
+			continue
+		}
 		if repo.local && result.DurableWorkDir != "" {
 			root, ref, dirty = c.env.LocalWorktree.GitRoot, result.BranchName, false
 			// Finalize removes a new branch when it contains no task changes.
