@@ -106,3 +106,99 @@ func TestPiHandledPromptDoesNotCloseActiveRun(t *testing.T) {
 		t.Fatal("settlement not observed")
 	}
 }
+
+func TestPiSupplementTransformedMessageStartAfterQueued(t *testing.T) {
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+	s := newPiSupplementSession(w)
+	s.observe([]byte(`{"type":"agent_start"}`))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- s.send(ctx, "change course") }()
+	line, err := bufio.NewReader(r).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cmd map[string]string
+	if err := json.Unmarshal(line, &cmd); err != nil || cmd["type"] != "steer" || cmd["message"] != "change course" {
+		t.Fatalf("command=%s err=%v", line, err)
+	}
+	// queued alone must not complete delivery
+	s.observe([]byte(`{"type":"response","id":"steer-1","command":"steer","success":true,"data":{"disposition":"queued"}}`))
+	select {
+	case err := <-result:
+		t.Fatalf("queue acknowledged as delivery: %v", err)
+	default:
+	}
+	// Pi input transform rewrites the user message text after accept.
+	transformed := []byte(`{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"change course\nAdditional context from transform"}]}}`)
+	s.observe(transformed)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("transformed message_start after queued should deliver: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("steering blocked after transformed message_start")
+	}
+	s.stop()
+}
+
+func TestPiSupplementQueuedWithoutMessageStartFails(t *testing.T) {
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+	s := newPiSupplementSession(w)
+	s.observe([]byte(`{"type":"agent_start"}`))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- s.send(ctx, "change course") }()
+	if _, err := bufio.NewReader(r).ReadBytes('\n'); err != nil {
+		t.Fatal(err)
+	}
+	s.observe([]byte(`{"type":"response","id":"steer-1","command":"steer","success":true,"data":{"disposition":"queued"}}`))
+	select {
+	case err := <-result:
+		t.Fatalf("queue alone must not deliver: %v", err)
+	default:
+	}
+	// Run settles / ends with no user message_start — still not consumed.
+	s.observe([]byte(`{"type":"agent_settled"}`))
+	s.stop()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("expected failure without consumption evidence")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("steering blocked")
+	}
+}
+
+func TestPiSupplementHandledDispositionDelivers(t *testing.T) {
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+	s := newPiSupplementSession(w)
+	s.observe([]byte(`{"type":"agent_start"}`))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- s.send(ctx, "change course") }()
+	if _, err := bufio.NewReader(r).ReadBytes('\n'); err != nil {
+		t.Fatal(err)
+	}
+	s.observe([]byte(`{"type":"response","id":"steer-1","command":"steer","success":true,"data":{"disposition":"handled"}}`))
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("handled disposition should deliver: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("steering blocked")
+	}
+	s.stop()
+}

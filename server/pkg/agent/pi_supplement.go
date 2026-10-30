@@ -195,8 +195,17 @@ func (s *piSupplementSession) observe(raw []byte) error {
 	}
 	if event.Type == "message_start" && event.Message.Role == "user" {
 		for _, part := range event.Message.Content {
-			if part.Type == "text" && part.Text == p.text {
+			if part.Type != "text" {
+				continue
+			}
+			// Exact text match covers the message-first race before the
+			// steer reply. After accepted (queued/handled), the next user
+			// message_start is consumption evidence even when Pi's input
+			// transform rewrites the steer text — do not require equality
+			// or substring matching. Session has one pending at a time.
+			if part.Text == p.text || p.accepted {
 				p.consumed = true
+				break
 			}
 		}
 	}
